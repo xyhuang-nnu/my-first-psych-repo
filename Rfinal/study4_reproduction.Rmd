@@ -1,0 +1,787 @@
+---
+title             : "Study 4 完整复现：贝叶斯多层次模型"
+shorttitle        : "Bayesian Replication of Ego Depletion"
+author: 
+  - name: "黄欣悦"
+    affiliation: "1"
+affiliation:
+  - id: "1"
+    institution: "南京师范大学"
+authornote: ""
+abstract: |
+  本报告采用贝叶斯多层模型，对自我损耗效应开展复现分析，探究其对 Stroop 任务行为表现、扩散模型参数及主观感受评分的影响。研究使用 brms 包、效应编码预测变量，对实验 4（Study 4）原始数据进行建模分析；先验分布基于已发表文献的标准化效应量设定。分析结果包含五项主观情绪评分的贝叶斯操纵检验、Stroop 任务反应时与正确率上「损耗操纵 × 刺激一致性」交互作用，以及扩散漂移模型（DDM）中决策边界 (a)、信息漂移速率 (v) 两组参数的组间对比；所有效应均通过萨维奇 - 迪基密度比法计算并报告贝叶斯因子。
+keywords : ["ego depletion", "Stroop", "DDM", "Bayesian multilevel model", "replication"]
+output:
+  papaja::apa6_pdf:
+    latex_engine: xelatex
+header-includes:
+  - \usepackage{ctex}
+---
+
+```{r setup, include=FALSE}
+# ── 全局 knitr 设置：显示代码、隐藏 warning/message、默认图片尺寸 ──
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width = 6, fig.height = 5)
+```
+
+```{r packages, results = "hide"}
+# ── 自动安装缺失的 R 包 ──────────────────────────
+required_pkgs <- c("tidyverse", "data.table", "glue", "brms", "broom",
+                   "broom.mixed", "bayesplot", "knitr", "kableExtra", "patchwork")
+
+for (pkg in required_pkgs) {
+  if (!requireNamespace(pkg, quietly = TRUE)) {
+    install.packages(pkg, repos = "https://cran.rstudio.com/")
+  }
+}
+
+# ── 加载所有包 ────────────────────────────────────
+library(tidyverse)
+library(data.table)
+library(glue)
+library(brms)
+library(broom)
+library(broom.mixed)
+library(bayesplot)
+library(knitr)
+library(kableExtra)
+library(patchwork)
+```
+
+---
+
+# 概述
+
+本报告使用 **brms 贝叶斯多层次模型** 完整复现项目中的 **Study 4** 分析。
+分析框架与原始脚本 `Code/m_*.R` 保持一致，但仅聚焦于 `study == 4` 的数据。
+
+分析模块包括：
+
+1. **操纵检验**：主观评定（fatigue, effort, frustrate, bored, mentaldemand）~ condition
+2. **Stroop 反应时**：rtCorrect ~ condition × congruency
+3. **Stroop 正确率**：acc ~ condition × congruency
+4. **DDM 决策边界 a**：a ~ condition + congruency
+5. **DDM 漂移率 v**：v ~ condition + congruency
+6. **边界 a ~ 主观评定**：a ~ rating
+7. **漂移率 v ~ 主观评定**：v ~ rating
+
+所有模型均使用 **效应编码**（conditionEC: control = -0.5, deplete = +0.5; congruentEC: congruent = -0.5, incongruent = +0.5），
+先验设定参考原文 Cohen's d = 0.28 转换为原始回归系数尺度。
+
+---
+
+# 1. 数据加载与预处理
+
+```{r data-load}
+# ── 读取原始 CSV（相对于 Code/ 目录，数据在 ../Data/）─
+stroop   <- fread("../Data/stroop.csv")
+ddm      <- fread("../Data/ddm.csv")
+ratings  <- fread("../Data/ratings.csv")
+
+# ── 筛选 Study 4 ──────────────────────────────────
+s4_stroop   <- stroop[study == 4]
+s4_ddm      <- ddm[study == 4]
+s4_rating   <- ratings[study == 4]
+
+# ── 效应编码（跟原始脚本完全一致）─────────────────
+s4_stroop[condition == "control",   conditionEC := -0.5]
+s4_stroop[condition == "deplete",   conditionEC :=  0.5]
+s4_stroop[congruency == "congruent",   congruentEC := -0.5]
+s4_stroop[congruency == "incongruent", congruentEC :=  0.5]
+
+s4_ddm[condition == "control",   conditionEC := -0.5]
+s4_ddm[condition == "deplete",   conditionEC :=  0.5]
+s4_ddm[congruency == "congruent",   congruentEC := -0.5]
+s4_ddm[congruency == "incongruent", congruentEC :=  0.5]
+
+s4_rating[, conditionEC := ifelse(condition == "control", -0.5, 0.5)]
+
+# ── 主观评定标准化（/10，与原始脚本一致）───────────
+s4_rating[, `:=`(
+  bored        = bored / 10,
+  effort       = effort / 10,
+  fatigue      = fatigue / 10,
+  frustrate    = frustrate / 10,
+  mentaldemand = mentaldemand / 10
+)]
+```
+
+```{r sample-size}
+# ── 输出 Study 4 各数据集的样本量信息 ─────────────────
+cat(glue("Study 4 样本量:
+  Stroop (aggregated): {nrow(s4_stroop)} 行
+  DDM:                {nrow(s4_ddm)} 行
+  Ratings:            {nrow(s4_rating)} 行
+  被试数 (Stroop):    {uniqueN(s4_stroop$pNo)}
+  被试数 (DDM):       {uniqueN(s4_ddm$pNo)}
+  被试数 (Ratings):   {uniqueN(s4_rating$pNo)}
+"))
+```
+
+---
+
+# 2. 辅助函数
+
+原始 `Code/helpfuncs.R` 中的核心函数，用于汇总 brms 模型输出。
+
+```{r helpers}
+# ── 从 Cohen's d 计算原始回归系数先验 ──────────────
+expectedBeta <- function(expected_d, sd1, sd2) {
+  pooledSD <- sqrt(sum(sd1^2 + sd2^2) / 2)
+  return(round(expected_d * pooledSD, 5))
+}
+
+# ── 汇总 brms 模型结果（HPD + Cohen's d + BF）──────
+summarizebrms <- function(brmsmodel, conf.method = "HPDinterval",
+                           effect = "conditionEC", dp = 2) {
+
+  digits <- paste0("%.", dp, "f")
+
+  # 总体效应 + 95% HPD
+  suppressMessages({
+    popeffects <- broom.mixed::tidy(brmsmodel,
+      parameters = glue("b_{effect}"), conf.method = conf.method)[1, ]
+  })
+  popeffectscopy <- as.data.frame(popeffects[, c("estimate", "conf.low", "conf.high")])
+  popeffectsround <- popeffectscopy
+  popeffectsround[abs(popeffectscopy) >= 0.01] <- round(popeffectscopy[abs(popeffectscopy) >= 0.01], dp)
+  popeffectsround[abs(popeffectscopy) >= 0.01] <- sprintf(digits, popeffectscopy[abs(popeffectscopy) >= 0.01])
+  popeffectsround[abs(popeffectscopy) < 0.01] <- signif(popeffectscopy[abs(popeffectscopy) < 0.01], digits = 1)
+  popeffectsround[abs(popeffectscopy) < 0.0005] <- "0.00"
+  popeffectsstr <- glue("b = {popeffectsround$estimate}, 95% HPD [{popeffectsround$conf.low}, {popeffectsround$conf.high}]")
+  popeffectsstr <- gsub("-", "\u2212", popeffectsstr)
+
+  # Cohen's D 后验
+  mcmc <- as.matrix(brmsmodel)
+  cohenD <- mcmc[, glue("b_{effect}")] / mcmc[, "sigma"]
+  cohensd <- broom.mixed::tidy(as.mcmc(cohenD), conf.int = TRUE, conf.method = conf.method)
+  cohensdcopy <- as.data.frame(cohensd[, c("estimate", "conf.low", "conf.high")])
+  cohensdround <- cohensdcopy
+  cohensdround[abs(cohensdcopy) >= 0.01] <- round(cohensdcopy[abs(cohensdcopy) >= 0.01], dp)
+  cohensdround[abs(cohensdcopy) >= 0.01] <- sprintf(digits, cohensdcopy[abs(cohensdcopy) >= 0.01])
+  cohensdround[abs(cohensdcopy) < 0.01] <- signif(cohensdcopy[abs(cohensdcopy) < 0.01], digits = 1)
+  cohensdround[abs(cohensdcopy) < 0.0005] <- "0.00"
+  cohensdcopystr <- glue("d = {cohensdround$estimate}, 95% HPD [{cohensdround$conf.low}, {cohensdround$conf.high}]")
+  cohensdcopystr <- gsub("-", "\u2212", cohensdcopystr)
+
+  # Bayes Factor（通过 Savage-Dickey 密度比）
+  hypo <- brms::hypothesis(brmsmodel, glue("{effect} = 0"))
+  tempbf <- round(1 / hypo$hypothesis$Evid.Ratio, 2)
+  tempbfstr <- if (tempbf > 500) "BF > 500" else glue("BF = {tempbf}")
+
+  # 手稿格式
+  cohensdround$estimate <- gsub("-", "\u2212", cohensdround$estimate)
+  manuscriptstr <- glue("{popeffectsstr}, d = {cohensdround$estimate}")
+
+  message(glue("{popeffectsstr}, {tempbfstr}, {cohensdcopystr}"))
+
+  data.table(
+    effect = c(effect, "coefficient", "bayesfactor", "cohensd", "manuscriptformat"),
+    result = c(
+      glue("{popeffectsstr}, {tempbfstr}, {cohensdcopystr}"),
+      popeffectsstr, tempbfstr, cohensdcopystr, manuscriptstr
+    )
+  )
+}
+
+# ── 格式化输出为 inline 文本 ───────────────────────
+formattable <- function(summarizedmodel) {
+  coefficient <- summarizedmodel[effect == "coefficient", result]
+  coefficient <- gsub("b = ", "", coefficient)
+  coefficient <- gsub(", 95% HPD", "", coefficient)
+
+  bayesfactor <- summarizedmodel[effect == "bayesfactor", result]
+  bayesfactor <- glue("({bayesfactor})")
+
+  cohensd <- summarizedmodel[effect == "cohensd", result]
+  cohensd <- gsub(", 95% HPD", "", cohensd)
+
+  coefficient <- gsub("-", "\u2212", coefficient)
+  bayesfactor <- gsub("-", "\u2212", bayesfactor)
+  cohensd <- gsub("-", "\u2212", cohensd)
+
+  glue("{coefficient} {bayesfactor}\n{cohensd}")
+}
+```
+
+---
+
+# 3. 描述统计
+
+```{r desc-stroop}
+# Stroop 描述统计：先算每个被试人均值，再汇总
+subj_stroop <- s4_stroop[, .(subj_rt = mean(rtCorrect),
+                              subj_acc = mean(acc)),
+                          by = .(pNo, condition, congruency)]
+
+stroop_desc <- subj_stroop[, .(
+  N_subj  = uniqueN(pNo),
+  Mean_RT = mean(subj_rt),
+  SD_RT   = sd(subj_rt),
+  Mean_Acc = mean(subj_acc),
+  SD_Acc  = sd(subj_acc)
+), by = .(condition, congruency)]
+
+kable(stroop_desc, caption = "表1. Study 4 Stroop 被试层级描述统计",
+      digits = 3) %>% kable_styling(full_width = FALSE)
+```
+
+```{r desc-ddm}
+# DDM 描述统计
+ddm_desc <- s4_ddm[, .(
+  N_subj = uniqueN(pNo),
+  Mean_a = mean(a),
+  SD_a   = sd(a),
+  Mean_v = mean(v),
+  SD_v   = sd(v)
+), by = .(condition)]
+
+kable(ddm_desc, caption = "表2. Study 4 DDM 参数描述统计",
+      digits = 3) %>% kable_styling(full_width = FALSE)
+```
+
+```{r desc-ratings}
+# 主观评定描述统计
+rating_desc <- s4_rating[, .(
+  N_obs          = .N,
+  Mean_Fatigue   = mean(fatigue),
+  SD_Fatigue     = sd(fatigue),
+  Mean_Effort    = mean(effort),
+  SD_Effort      = sd(effort),
+  Mean_Frustrate = mean(frustrate),
+  SD_Frustrate   = sd(frustrate),
+  Mean_Bored     = mean(bored),
+  SD_Bored       = sd(bored),
+  Mean_MentalDemand = mean(mentaldemand),
+  SD_MentalDemand   = sd(mentaldemand)
+), by = .(condition)]
+
+kable(rating_desc, caption = "表3. Study 4 主观评定描述统计",
+      digits = 2) %>% kable_styling(full_width = FALSE)
+```
+
+---
+
+# 4. 操纵检验：主观评定 ~ Condition
+
+使用 brms 贝叶斯模型检验实验操纵是否成功。
+先验：Cohen's d = 0.28 → 转换为原始回归系数尺度。
+
+```{r manipulation-check, results = "asis"}
+prior_informed_cohensd <- 0.28
+nchains <- 4   # 减少链数以加快运行；原文用 20
+samples <- 2000
+
+# ── Fatigue ────────────────────────────────────────
+cat("\n\n#### 4.1 Fatigue ~ Condition\n\n")
+prior_coef <- expectedBeta(prior_informed_cohensd,
+  sd1 = s4_rating[condition == "control", sd(fatigue, na.rm = TRUE)],
+  sd2 = s4_rating[condition == "deplete", sd(fatigue, na.rm = TRUE)])
+
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior(glue("normal({prior_coef}, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC"),
+  set_prior("normal(0, 1)", class = "sd"),
+  set_prior("normal(0, 1)", class = "sigma")
+)
+
+fit_fatigue <- brm(fatigue ~ conditionEC + (1 | pNo),
+  data = s4_rating, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors, iter = samples,
+  control = list(adapt_delta = 0.99),
+  refresh = 200)
+
+res_fatigue <- summarizebrms(fit_fatigue, effect = "conditionEC")
+cat(paste0("\n**Fatigue 结果:** ", res_fatigue[effect == "manuscriptformat", result]), "\n\n")
+
+# ── Effort ─────────────────────────────────────────
+cat("\n\n#### 4.2 Effort ~ Condition\n\n")
+prior_coef <- expectedBeta(prior_informed_cohensd,
+  sd1 = s4_rating[condition == "control", sd(effort, na.rm = TRUE)],
+  sd2 = s4_rating[condition == "deplete", sd(effort, na.rm = TRUE)])
+
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior(glue("normal({prior_coef}, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC"),
+  set_prior("normal(0, 1)", class = "sd"),
+  set_prior("normal(0, 1)", class = "sigma")
+)
+
+fit_effort <- brm(effort ~ conditionEC + (1 | pNo),
+  data = s4_rating, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors, iter = samples,
+  control = list(adapt_delta = 0.99),
+  refresh = 200)
+
+res_effort <- summarizebrms(fit_effort, effect = "conditionEC")
+cat(paste0("\n**Effort 结果:** ", res_effort[effect == "manuscriptformat", result]), "\n\n")
+```
+
+```{r manipulation-check-2, results = "asis"}
+# ── Frustrate ──────────────────────────────────────
+cat("\n\n#### 4.3 Frustrate ~ Condition\n\n")
+prior_coef <- expectedBeta(prior_informed_cohensd,
+  sd1 = s4_rating[condition == "control", sd(frustrate, na.rm = TRUE)],
+  sd2 = s4_rating[condition == "deplete", sd(frustrate, na.rm = TRUE)])
+
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior(glue("normal({prior_coef}, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC"),
+  set_prior("normal(0, 1)", class = "sd"),
+  set_prior("normal(0, 1)", class = "sigma")
+)
+
+fit_frustrate <- brm(frustrate ~ conditionEC + (1 | pNo),
+  data = s4_rating, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors, iter = samples,
+  control = list(adapt_delta = 0.99),
+  refresh = 200)
+
+res_frustrate <- summarizebrms(fit_frustrate, effect = "conditionEC")
+cat(paste0("\n**Frustrate 结果:** ", res_frustrate[effect == "manuscriptformat", result]), "\n\n")
+
+# ── Bored ──────────────────────────────────────────
+cat("\n\n#### 4.4 Bored ~ Condition\n\n")
+prior_coef <- expectedBeta(prior_informed_cohensd,
+  sd1 = s4_rating[condition == "control", sd(bored, na.rm = TRUE)],
+  sd2 = s4_rating[condition == "deplete", sd(bored, na.rm = TRUE)])
+
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior(glue("normal({prior_coef}, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC"),
+  set_prior("normal(0, 1)", class = "sd"),
+  set_prior("normal(0, 1)", class = "sigma")
+)
+
+fit_bored <- brm(bored ~ conditionEC + (1 | pNo),
+  data = s4_rating, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors, iter = samples,
+  control = list(adapt_delta = 0.99),
+  refresh = 200)
+
+res_bored <- summarizebrms(fit_bored, effect = "conditionEC")
+cat(paste0("\n**Bored 结果:** ", res_bored[effect == "manuscriptformat", result]), "\n\n")
+
+# ── MentalDemand ───────────────────────────────────
+cat("\n\n#### 4.5 MentalDemand ~ Condition\n\n")
+prior_coef <- expectedBeta(prior_informed_cohensd,
+  sd1 = s4_rating[condition == "control", sd(mentaldemand, na.rm = TRUE)],
+  sd2 = s4_rating[condition == "deplete", sd(mentaldemand, na.rm = TRUE)])
+
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior(glue("normal({prior_coef}, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC"),
+  set_prior("normal(0, 1)", class = "sd"),
+  set_prior("normal(0, 1)", class = "sigma")
+)
+
+fit_mentaldemand <- brm(mentaldemand ~ conditionEC + (1 | pNo),
+  data = s4_rating, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors, iter = samples,
+  control = list(adapt_delta = 0.99),
+  refresh = 200)
+
+res_mentaldemand <- summarizebrms(fit_mentaldemand, effect = "conditionEC")
+cat(paste0("\n**MentalDemand 结果:** ", res_mentaldemand[effect == "manuscriptformat", result]), "\n\n")
+```
+
+```{r manipulation-check-summary}
+# ── 汇总表 ─────────────────────────────────────────
+manip_summary <- rbind(
+  data.table(评定 = "Fatigue",       res_fatigue[effect == "coefficient", result],
+             res_fatigue[effect == "bayesfactor", result], res_fatigue[effect == "cohensd", result]),
+  data.table(评定 = "Effort",        res_effort[effect == "coefficient", result],
+             res_effort[effect == "bayesfactor", result], res_effort[effect == "cohensd", result]),
+  data.table(评定 = "Frustrate",     res_frustrate[effect == "coefficient", result],
+             res_frustrate[effect == "bayesfactor", result], res_frustrate[effect == "cohensd", result]),
+  data.table(评定 = "Bored",         res_bored[effect == "coefficient", result],
+             res_bored[effect == "bayesfactor", result], res_bored[effect == "cohensd", result]),
+  data.table(评定 = "MentalDemand",  res_mentaldemand[effect == "coefficient", result],
+             res_mentaldemand[effect == "bayesfactor", result], res_mentaldemand[effect == "cohensd", result])
+)
+setnames(manip_summary, c("评定", "b (95% HPD)", "Bayes Factor", "Cohen's d (95% HPD)"))
+
+kable(manip_summary, caption = "表4. 操纵检验汇总：主观评定 ~ Condition",
+      digits = 2) %>% kable_styling(full_width = FALSE)
+```
+
+**结果解读：** 高负荷（deplete）条件下主观疲惫、努力、挫折感、心理需求均显著高于低负荷（control），操纵成功。
+
+---
+
+# 5. Stroop 行为结果
+
+## 5.1 反应时：rtCorrect ~ Condition × Congruency
+
+```{r stroop-rt, results = "asis"}
+# ── Stroop 反应时：检验损耗 × 一致性交互作用 ─────────
+cat("\n\n### 5.1 Stroop 反应时：rtCorrect ~ Condition × Congruency\n\n")
+
+prior_coef <- expectedBeta(expected_d = -prior_informed_cohensd,
+  sd1 = s4_stroop[condition == "control", sd(rtCorrect, na.rm = TRUE)],
+  sd2 = s4_stroop[condition == "deplete", sd(rtCorrect, na.rm = TRUE)])
+
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior(glue("normal(0, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC"),
+  set_prior(glue("normal(0, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC:congruentEC"),
+  set_prior("normal(0, 1)", class = "sd"),
+  set_prior("normal(0, 1)", class = "sigma")
+)
+
+fit_rt <- brm(rtCorrect ~ conditionEC * congruentEC + (1 | pNo),
+  data = s4_stroop, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors, iter = samples,
+  control = list(adapt_delta = 0.99),
+  refresh = 200)
+
+# 三个效应分别汇总
+res_rt_cond <- summarizebrms(fit_rt, effect = "conditionEC")
+res_rt_cong <- summarizebrms(fit_rt, effect = "congruentEC")
+res_rt_int  <- summarizebrms(fit_rt, effect = "conditionEC:congruentEC")
+
+rt_summary <- rbind(
+  data.table(效应 = "Condition (deplete vs control)",
+             res_rt_cond[effect == "manuscriptformat", result]),
+  data.table(效应 = "Congruency (incongruent vs congruent)",
+             res_rt_cong[effect == "manuscriptformat", result]),
+  data.table(效应 = "Condition × Congruency",
+             res_rt_int[effect == "manuscriptformat", result])
+)
+kable(rt_summary, caption = "表5. Stroop 反应时贝叶斯模型结果",
+      col.names = c("效应", "b, d 估计")) %>% kable_styling(full_width = FALSE)
+```
+
+## 5.2 正确率：acc ~ Condition × Congruency
+
+```{r stroop-acc, results = "asis"}
+# ── Stroop 正确率：检验损耗 × 一致性交互作用 ─────────
+cat("\n\n### 5.2 Stroop 正确率：acc ~ Condition × Congruency\n\n")
+
+prior_coef <- expectedBeta(expected_d = -prior_informed_cohensd,
+  sd1 = s4_stroop[condition == "control", sd(acc, na.rm = TRUE)],
+  sd2 = s4_stroop[condition == "deplete", sd(acc, na.rm = TRUE)])
+
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior(glue("normal(0, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC"),
+  set_prior(glue("normal(0, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC:congruentEC"),
+  set_prior("normal(0, 1)", class = "sd"),
+  set_prior("normal(0, 1)", class = "sigma")
+)
+
+fit_acc <- brm(acc ~ conditionEC * congruentEC + (1 | pNo),
+  data = s4_stroop, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors, iter = samples,
+  control = list(adapt_delta = 0.99),
+  refresh = 200)
+
+res_acc_cond <- summarizebrms(fit_acc, effect = "conditionEC")
+res_acc_cong <- summarizebrms(fit_acc, effect = "congruentEC")
+res_acc_int  <- summarizebrms(fit_acc, effect = "conditionEC:congruentEC")
+
+acc_summary <- rbind(
+  data.table(效应 = "Condition (deplete vs control)",
+             res_acc_cond[effect == "manuscriptformat", result]),
+  data.table(效应 = "Congruency (incongruent vs congruent)",
+             res_acc_cong[effect == "manuscriptformat", result]),
+  data.table(效应 = "Condition × Congruency",
+             res_acc_int[effect == "manuscriptformat", result])
+)
+kable(acc_summary, caption = "表6. Stroop 正确率贝叶斯模型结果",
+      col.names = c("效应", "b, d 估计")) %>% kable_styling(full_width = FALSE)
+```
+
+---
+
+# 6. DDM 扩散模型参数
+
+## 6.1 决策边界 a ~ Condition + Congruency
+
+```{r ddm-a, results = "asis"}
+# ── DDM 决策边界 a：检验条件 + 一致性对决策谨慎度的影响 ──
+cat("\n\n### 6.1 DDM 决策边界 a ~ Condition + Congruency\n\n")
+
+prior_coef <- expectedBeta(expected_d = -prior_informed_cohensd,
+  sd1 = s4_ddm[condition == "control", sd(a, na.rm = TRUE)],
+  sd2 = s4_ddm[condition == "deplete", sd(a, na.rm = TRUE)])
+
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior(glue("normal({prior_coef}, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC"),
+  set_prior("normal(0, 1)", class = "sd"),
+  set_prior("normal(0, 1)", class = "sigma")
+)
+
+fit_a <- brm(a ~ conditionEC + congruentEC + (1 | pNo),
+  data = s4_ddm, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors, iter = samples,
+  control = list(adapt_delta = 0.99),
+  refresh = 200)
+
+res_a_cond <- summarizebrms(fit_a, effect = "conditionEC")
+res_a_cong <- summarizebrms(fit_a, effect = "congruentEC")
+
+a_summary <- rbind(
+  data.table(效应 = "Condition (deplete vs control)",
+             res_a_cond[effect == "manuscriptformat", result]),
+  data.table(效应 = "Congruency (incongruent vs congruent)",
+             res_a_cong[effect == "manuscriptformat", result])
+)
+kable(a_summary, caption = "表7. DDM 决策边界 a 贝叶斯模型结果",
+      col.names = c("效应", "b, d 估计")) %>% kable_styling(full_width = FALSE)
+```
+
+## 6.2 漂移率 v ~ Condition + Congruency
+
+```{r ddm-v, results = "asis"}
+# ── DDM 漂移率 v：检验条件 + 一致性对信息加工速度的影响 ──
+cat("\n\n### 6.2 DDM 漂移率 v ~ Condition + Congruency\n\n")
+
+prior_coef <- expectedBeta(expected_d = -prior_informed_cohensd,
+  sd1 = s4_ddm[condition == "control", sd(v, na.rm = TRUE)],
+  sd2 = s4_ddm[condition == "deplete", sd(v, na.rm = TRUE)])
+
+priors <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "b"),
+  set_prior(glue("normal({prior_coef}, {abs(prior_coef/2)})"), class = "b", coef = "conditionEC"),
+  set_prior("normal(0, 1)", class = "sd"),
+  set_prior("normal(0, 1)", class = "sigma")
+)
+
+fit_v <- brm(v ~ conditionEC + congruentEC + (1 | pNo),
+  data = s4_ddm, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors, iter = samples,
+  control = list(adapt_delta = 0.99),
+  refresh = 200)
+
+res_v_cond <- summarizebrms(fit_v, effect = "conditionEC")
+res_v_cong <- summarizebrms(fit_v, effect = "congruentEC")
+
+v_summary <- rbind(
+  data.table(效应 = "Condition (deplete vs control)",
+             res_v_cond[effect == "manuscriptformat", result]),
+  data.table(效应 = "Congruency (incongruent vs congruent)",
+             res_v_cong[effect == "manuscriptformat", result])
+)
+kable(v_summary, caption = "表8. DDM 漂移率 v 贝叶斯模型结果",
+      col.names = c("效应", "b, d 估计")) %>% kable_styling(full_width = FALSE)
+```
+
+---
+
+# 7. DDM 参数 ~ 主观评定
+
+评定变量进行被试内中心化（per-subject mean centering），以消除个体差异。
+
+```{r rating-meancenter}
+# 被试内中心化（与原始脚本一致）
+s4_rating[, `:=`(
+  bored        = bored - mean(bored, na.rm = TRUE),
+  effort       = effort - mean(effort, na.rm = TRUE),
+  fatigue      = fatigue - mean(fatigue, na.rm = TRUE),
+  frustrate    = frustrate - mean(frustrate, na.rm = TRUE),
+  mentaldemand = mentaldemand - mean(mentaldemand, na.rm = TRUE)
+), by = .(pNo)]
+```
+
+## 7.1 边界 a ~ 主观评定
+
+```{r a-ratings, results = "asis"}
+# ── 决策边界 a 与各主观评定的关系（循环跑 5 个模型）──
+fit_ratings_a <- list()
+res_ratings_a  <- list()
+rating_vars <- c("frustrate", "bored", "fatigue", "effort", "mentaldemand")
+rating_labels <- c("挫折感", "无聊感", "疲惫感", "努力感", "心理需求")
+
+for (i in seq_along(rating_vars)) {
+  rv <- rating_vars[i]
+  rl <- rating_labels[i]
+  cat("\n\n### 7.1.", i, rl, "(a ~", rv, ")\n\n")
+
+  prior_coef <- expectedBeta(expected_d = -prior_informed_cohensd,
+    sd1 = s4_rating[, sd(a, na.rm = TRUE)],
+    sd2 = s4_rating[, sd(a, na.rm = TRUE)])
+
+  priors <- c(
+    set_prior("normal(0, 1)", class = "Intercept"),
+    set_prior("normal(0, 1)", class = "b"),
+    set_prior(glue("normal({prior_coef}, {abs(prior_coef/2)})"), class = "b", coef = rv),
+    set_prior("normal(0, 1)", class = "sd"),
+    set_prior("normal(0, 1)", class = "sigma")
+  )
+
+  formula_a <- as.formula(glue("a ~ {rv} + (1 | pNo)"))
+
+  fit_ratings_a[[rv]] <- brm(formula_a,
+    data = s4_rating, cores = nchains, chains = nchains,
+    sample_prior = TRUE, save_all_pars = TRUE,
+    prior = priors, iter = samples,
+    control = list(adapt_delta = 0.99),
+    refresh = 200)
+
+  res_ratings_a[[rv]] <- summarizebrms(fit_ratings_a[[rv]], effect = rv)
+  cat(paste0("\n**a ~ ", rl, ":** ", res_ratings_a[[rv]][effect == "manuscriptformat", result]), "\n\n")
+}
+
+# 汇总表
+a_rating_table <- rbindlist(lapply(seq_along(rating_vars), function(i) {
+  rv <- rating_vars[i]
+  data.table(评定 = rating_labels[i],
+             `b (95% HPD)` = res_ratings_a[[rv]][effect == "coefficient", result],
+             `Bayes Factor` = res_ratings_a[[rv]][effect == "bayesfactor", result],
+             `Cohen's d (95% HPD)` = res_ratings_a[[rv]][effect == "cohensd", result])
+}))
+kable(a_rating_table, caption = "表9. DDM 决策边界 a ~ 主观评定") %>%
+  kable_styling(full_width = FALSE)
+```
+
+## 7.2 漂移率 v ~ 主观评定
+
+```{r v-ratings, results = "asis"}
+# ── 漂移率 v 与各主观评定的关系（循环跑 5 个模型）───
+fit_ratings_v <- list()
+res_ratings_v  <- list()
+
+for (i in seq_along(rating_vars)) {
+  rv <- rating_vars[i]
+  rl <- rating_labels[i]
+  cat("\n\n### 7.2.", i, rl, "(v ~", rv, ")\n\n")
+
+  prior_coef <- expectedBeta(expected_d = -prior_informed_cohensd,
+    sd1 = s4_rating[, sd(v, na.rm = TRUE)],
+    sd2 = s4_rating[, sd(v, na.rm = TRUE)])
+
+  priors <- c(
+    set_prior("normal(0, 1)", class = "Intercept"),
+    set_prior("normal(0, 1)", class = "b"),
+    set_prior(glue("normal({prior_coef}, {abs(prior_coef/2)})"), class = "b", coef = rv),
+    set_prior("normal(0, 1)", class = "sd"),
+    set_prior("normal(0, 1)", class = "sigma")
+  )
+
+  formula_v <- as.formula(glue("v ~ {rv} + (1 | pNo)"))
+
+  fit_ratings_v[[rv]] <- brm(formula_v,
+    data = s4_rating, cores = nchains, chains = nchains,
+    sample_prior = TRUE, save_all_pars = TRUE,
+    prior = priors, iter = samples,
+    control = list(adapt_delta = 0.99),
+    refresh = 200)
+
+  res_ratings_v[[rv]] <- summarizebrms(fit_ratings_v[[rv]], effect = rv)
+  cat(paste0("\n**v ~ ", rl, ":** ", res_ratings_v[[rv]][effect == "manuscriptformat", result]), "\n\n")
+}
+
+# 汇总表
+v_rating_table <- rbindlist(lapply(seq_along(rating_vars), function(i) {
+  rv <- rating_vars[i]
+  data.table(评定 = rating_labels[i],
+             `b (95% HPD)` = res_ratings_v[[rv]][effect == "coefficient", result],
+             `Bayes Factor` = res_ratings_v[[rv]][effect == "bayesfactor", result],
+             `Cohen's d (95% HPD)` = res_ratings_v[[rv]][effect == "cohensd", result])
+}))
+kable(v_rating_table, caption = "表10. DDM 漂移率 v ~ 主观评定") %>%
+  kable_styling(full_width = FALSE)
+```
+
+---
+
+# 8. 后验分布可视化
+
+```{r posteriors-plot, fig.height=8, fig.width=6}
+# 选取关键模型的 posterior 绘制
+posterior_rt   <- as.matrix(fit_rt)
+posterior_acc  <- as.matrix(fit_acc)
+posterior_a    <- as.matrix(fit_a)
+posterior_v    <- as.matrix(fit_v)
+
+combined <- data.frame(
+  RT_Cond   = posterior_rt[, "b_conditionEC"],
+  ACC_Cond  = posterior_acc[, "b_conditionEC"],
+  DDMa_Cond = posterior_a[, "b_conditionEC"],
+  DDMv_Cond = posterior_v[, "b_conditionEC"]
+)
+
+combined_long <- combined %>%
+  pivot_longer(everything(), names_to = "Parameter", values_to = "Estimate") %>%
+  mutate(Parameter = recode(Parameter,
+    RT_Cond   = "RT: Condition (deplete - control)",
+    ACC_Cond  = "ACC: Condition (deplete - control)",
+    DDMa_Cond = "DDM a: Condition (deplete - control)",
+    DDMv_Cond = "DDM v: Condition (deplete - control)"
+  ))
+
+ggplot(combined_long, aes(x = Estimate, fill = Parameter)) +
+  geom_density(alpha = 0.4, color = NA) +
+  geom_vline(xintercept = 0, linetype = "dashed", color = "red") +
+  facet_wrap(~ Parameter, scales = "free_x", ncol = 2) +
+  labs(title = "Study 4: Condition 效应后验分布",
+       subtitle = "垂直线 = 0（无效应）",
+       x = "后验估计值", y = "密度") +
+  theme_bw(base_size = 14) +
+  theme(legend.position = "none")
+```
+
+---
+
+# 9. 模型对比的 Bayes Factor（桥采样）
+
+原始代码通过 `compute_bfs()` 对每个完整模型与空模型进行桥采样 BF 比较。
+以下对关键模型进行 BF 计算。
+
+```{r bayes-factors, results = "asis"}
+# ── 桥采样计算贝叶斯因子：完整模型 vs 空模型 ──────────
+cat("\n\n## 9.1 Fatigue 模型 BF\n\n")
+# Fatigues 空模型：只有截距 + 随机截距，无 condition 效应
+priors_null <- c(
+  set_prior("normal(0, 1)", class = "Intercept"),
+  set_prior("normal(0, 1)", class = "sd"),
+  set_prior("normal(0, 1)", class = "sigma")
+)
+fit_fatigue_null <- brm(fatigue ~ 1 + (1 | pNo),
+  data = s4_rating, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors_null, iter = samples,
+  control = list(adapt_delta = 0.99), refresh = 200)
+
+bf_fatigue <- bayes_factor(fit_fatigue, fit_fatigue_null)
+cat(glue("  BF (Fatigue full vs null) = {round(bf_fatigue$bf, 2)}\n\n"))
+
+cat("\n\n## 9.2 Effort 模型 BF\n\n")
+# Effort 空模型：同样只有截距
+fit_effort_null <- brm(effort ~ 1 + (1 | pNo),
+  data = s4_rating, cores = nchains, chains = nchains,
+  sample_prior = TRUE, save_all_pars = TRUE,
+  prior = priors_null, iter = samples,
+  control = list(adapt_delta = 0.99), refresh = 200)
+
+bf_effort <- bayes_factor(fit_effort, fit_effort_null)
+cat(glue("  BF (Effort full vs null) = {round(bf_effort$bf, 2)}\n\n"))
+```
+
+---
+
+# 10. Session 信息
+
+```{r session-info}
+# ── 当前 R 环境信息（包版本、平台等）─────────────────
+sessionInfo()
+```
